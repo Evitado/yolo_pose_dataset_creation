@@ -10,7 +10,7 @@ This folder contains the trained YOLOv8-Pose model for aircraft keypoint estimat
 ```
 yolo pose train \
     model=yolov8s-pose.pt \
-    data=../hdf5_dataset_creation/aircraft_pose_all/aircraft_pose.yaml \
+    data=./aircraft_pose_all/aircraft_pose.yaml \
     imgsz=1024 \
     epochs=150 \
     batch=8 \
