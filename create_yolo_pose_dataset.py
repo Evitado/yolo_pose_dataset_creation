@@ -53,7 +53,7 @@ from config_dataset import (
     KPT_BBOX_MARGIN_PX,
     ROLL_WIDE_BBOX,
     ROLL_WIDE_BBOX_FRAC,
-    ROLL_WIDE_BBOX_COLS,
+    ROLL_WIDE_BBOX_COLS,  # still kept for diagnostics / compatibility
     RAY_VISIBILITY_CHECK,
     RAY_TOL,
     RAY_PATCH_RADIUS,
@@ -78,6 +78,54 @@ from projection_helpers import (
     find_alias,
     _fill_nans,
 )
+
+
+# =========================
+# Helper: smart azimuth seam placement
+# =========================
+def find_best_azimuth_roll(mask2d: np.ndarray) -> int:
+    """
+    Given a boolean is_aircraft mask (H, W), find a horizontal roll (shift)
+    that places the panorama seam (column 0) in the largest empty-azimuth gap.
+
+    Returns:
+        shift (int): number of columns to np.roll(..., shift=shift, axis=1)
+
+    If we cannot find any empty columns, or rolling does not help, returns 0.
+    """
+    H, W = mask2d.shape
+    col_has_aircraft = mask2d.any(axis=0)  # (W,)
+    empty = ~col_has_aircraft
+
+    if not np.any(empty):
+        # Every column has aircraft → nothing to do
+        return 0
+
+    best_len = 0
+    best_start = 0
+
+    # Simple O(W^2) search, W~1024 so fine.
+    for start in range(W):
+        if not empty[start]:
+            continue
+        length = 0
+        while length < W and empty[(start + length) % W]:
+            length += 1
+        if length > best_len:
+            best_len = length
+            best_start = start
+
+    if best_len <= 0:
+        return 0
+
+    # Put seam in the middle of the largest empty run
+    seam_col = (best_start + best_len // 2) % W
+
+    # We want seam_col -> 0 (left edge), so roll left by seam_col
+    shift = -int(seam_col)
+    if shift % W == 0:
+        return 0
+    return shift
 
 
 def create_dataset(
@@ -293,24 +341,33 @@ def create_dataset(
                     bbox_w = (x2 - x1 + 1)
                     bbox_frac = bbox_w / float(W)
 
-                    # --- ROLL LOGIC ---
+                    # --- ROLL LOGIC (smart seam placement) ---
                     if ROLL_WIDE_BBOX and bbox_frac > ROLL_WIDE_BBOX_FRAC and W > 1:
-                        shift = ROLL_WIDE_BBOX_COLS % W
-                        print(
-                            f"    [ROLL] Wide bbox (frac={bbox_frac:.3f}) → rolling by {shift} cols"
-                        )
-                        img = np.roll(img, shift=shift, axis=1)
-                        mask2d = np.roll(mask2d, shift=shift, axis=1)
-                        xyz_hw3 = np.roll(xyz_hw3, shift=shift, axis=1)
+                        # Prefer data-driven seam placement
+                        shift = find_best_azimuth_roll(mask2d)
+                        if shift == 0:
+                            # Fallback to config roll if seam logic fails
+                            shift = ROLL_WIDE_BBOX_COLS % W
 
-                        # recompute bbox after roll
-                        bb2 = bbox_from_mask(mask2d)
-                        if bb2 is None:
-                            print("    [SKIP] Empty aircraft mask after roll")
-                            continue
-                        x1, y1, x2, y2 = bb2
-                        bbox_w = (x2 - x1 + 1)
-                        bbox_frac = bbox_w / float(W)
+                        if shift != 0:
+                            print(
+                                f"    [ROLL] Wide bbox (frac={bbox_frac:.3f}) "
+                                f"→ rolling by {shift} cols"
+                            )
+                            img = np.roll(img, shift=shift, axis=1)
+                            mask2d = np.roll(mask2d, shift=shift, axis=1)
+                            xyz_hw3 = np.roll(xyz_hw3, shift=shift, axis=1)
+
+                            # recompute bbox after roll
+                            bb2 = bbox_from_mask(mask2d)
+                            if bb2 is None:
+                                print("    [SKIP] Empty aircraft mask after roll")
+                                continue
+                            x1, y1, x2, y2 = bb2
+                            bbox_w = (x2 - x1 + 1)
+                            bbox_frac = bbox_w / float(W)
+
+                        # still too wide → probably something really off, skip
                         if bbox_frac > 0.6:
                             print(
                                 f"    [SKIP] BBox too wide ({bbox_frac:.3f} > 0.6) in {unique_scene}"
@@ -486,10 +543,7 @@ def create_dataset(
                                     rc_by_name[SYN_KP_NAME] = (r_syn_int, c_syn_int)
                                     vis_by_name[SYN_KP_NAME] = 1
                             else:
-                                rc_by_name[SYN_KP_NAME] = (r_syn_int, c_syn_int)
-                                vis_by_name[SYN_KP_NAME] = 1
-                        else:
-                            vis_by_name[SYN_KP_NAME] = 0
+                                vis_by_name[SYN_KP_NAME] = 0
                     else:
                         vis_by_name[SYN_KP_NAME] = 0
 

@@ -45,17 +45,42 @@ def _norm_uint8(x: np.ndarray) -> np.ndarray:
 
 def build_rgb_from_cols(flat: np.ndarray, cols: List[str], H: int, W: int) -> Optional[np.ndarray]:
     """
-    Build an RGB image from point columns.
+    Build an RGB image optimized for YOLO learning (not for nice visualization).
+
+    Channels:
+      R = reflectivity (autoscaled per image)
+      G = intensity    (autoscaled per image)
+      B = "inverse log-range" (nearer = brighter, farther = darker)
 
     Requires columns: 'reflectivity', 'range', 'intensity'.
     """
     idx = {c: i for i, c in enumerate(cols)}
     if all(k in idx for k in ("reflectivity", "range", "intensity")):
-        r = _norm_uint8(flat[:, idx["reflectivity"]]).reshape(H, W)
-        g = _norm_uint8(flat[:, idx["range"]]).reshape(H, W)
-        b = _norm_uint8(flat[:, idx["intensity"]]).reshape(H, W)
+        refl  = flat[:, idx["reflectivity"]]
+        rng   = flat[:, idx["range"]]
+        inten = flat[:, idx["intensity"]]
+
+        # avoid log(0)
+        rng_safe = np.clip(rng, 1e-3, None)
+        log_range = np.log(rng_safe)
+
+        # per-image autoscale to [0, 1]
+        refl_n      = _autoscale(refl)
+        inten_n     = _autoscale(inten)
+        log_range_n = _autoscale(log_range)
+
+        # depth-like: near brighter, far darker
+        depth_like = 1.0 - log_range_n
+        depth_like = np.clip(depth_like, 0.0, 1.0)
+
+        r = (refl_n * 255).astype(np.uint8).reshape(H, W)
+        g = (inten_n * 255).astype(np.uint8).reshape(H, W)
+        b = (depth_like * 255).astype(np.uint8).reshape(H, W)
+
         return np.stack([r, g, b], axis=-1)
+
     return None
+
 
 
 def angles_from_xyz(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

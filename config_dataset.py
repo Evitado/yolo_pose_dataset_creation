@@ -26,7 +26,7 @@ SPLIT: Tuple[float, float, float] = (0.8, 0.1, 0.1)
 RANDOM_SEED: int = 123
 
 # Limit number of H5 files (for quick testing). Set to None to use all files.
-MAX_H5_FILES: Optional[int] = 5   # e.g. 4 or 5 for testing, or None for all
+MAX_H5_FILES: Optional[int] = None   # e.g. 4 or 5 for testing, or None for all
 
 # =========================
 # Image rendering
