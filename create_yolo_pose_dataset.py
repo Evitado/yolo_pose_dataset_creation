@@ -4,22 +4,11 @@
 """
 Create a unified YOLO-pose dataset from many aircraft HDF5 LiDAR range-image files.
 
-This script:
-- Reads all HDF5 scenes (local or gs://)
-- Projects 3D aircraft keypoints
-- Creates label files + images for YOLO pose
-- Adds synthetic midpoint keypoint ("front_wheels_mid")
-- Applies visibility + cluster adjustment rules
-- Produces train/val/test splits
-- Writes YOLO dataset YAML and visualizations
+This version uses a **BAG-LEVEL SPLIT** (by H5 file), so TEST contains bags (H5 files)
+that were not seen in TRAIN/VAL.
 
-Uses defaults from config_dataset.py, but you can override via CLI:
-
-    python create_yolo_pose_dataset.py \\
-        --source gs://.../mydata \\
-        --out ./my_dataset \\
-        --train-ratio 0.7 --val-ratio 0.2 --test-ratio 0.1 \\
-        --max-h5 5
+Because each H5 can have a different number of scenes, the split is **balanced by scene count**
+(whole files are assigned to train/val/test to approximately match the desired scene ratios).
 """
 
 import json
@@ -53,7 +42,7 @@ from config_dataset import (
     KPT_BBOX_MARGIN_PX,
     ROLL_WIDE_BBOX,
     ROLL_WIDE_BBOX_FRAC,
-    ROLL_WIDE_BBOX_COLS,  # still kept for diagnostics / compatibility
+    ROLL_WIDE_BBOX_COLS,
     RAY_VISIBILITY_CHECK,
     RAY_TOL,
     RAY_PATCH_RADIUS,
@@ -98,13 +87,11 @@ def find_best_azimuth_roll(mask2d: np.ndarray) -> int:
     empty = ~col_has_aircraft
 
     if not np.any(empty):
-        # Every column has aircraft → nothing to do
         return 0
 
     best_len = 0
     best_start = 0
 
-    # Simple O(W^2) search, W~1024 so fine.
     for start in range(W):
         if not empty[start]:
             continue
@@ -118,14 +105,60 @@ def find_best_azimuth_roll(mask2d: np.ndarray) -> int:
     if best_len <= 0:
         return 0
 
-    # Put seam in the middle of the largest empty run
     seam_col = (best_start + best_len // 2) % W
-
-    # We want seam_col -> 0 (left edge), so roll left by seam_col
     shift = -int(seam_col)
     if shift % W == 0:
         return 0
     return shift
+
+
+def _balanced_bag_split_by_scene_count(
+    scenes_by_file: Dict[str, List[str]],
+    split: Tuple[float, float, float],
+    seed: int,
+):
+    """
+    Assign whole H5 files to train/val/test to approximately match scene-count ratios.
+    Returns:
+      split_for_file(h5p)->"train"/"val"/"test",
+      assigned_files dict,
+      scene_counts dict,
+      targets dict
+    """
+    rng = random.Random(seed)
+
+    items = [(h5p, len(scene_list)) for h5p, scene_list in scenes_by_file.items()]
+    rng.shuffle(items)
+
+    total_scenes_all = sum(n for _, n in items)
+    if total_scenes_all == 0:
+        raise RuntimeError("No scenes found for splitting.")
+
+    # targets in scenes
+    target_train = int(total_scenes_all * split[0])
+    target_val = int(total_scenes_all * split[1])
+    target_test = total_scenes_all - target_train - target_val
+
+    targets = {"train": target_train, "val": target_val, "test": target_test}
+
+    assigned = {"train": set(), "val": set(), "test": set()}
+    count = {"train": 0, "val": 0, "test": 0}
+
+    # Greedy: place largest files first where deficit is largest
+    for h5p, nsc in sorted(items, key=lambda x: x[1], reverse=True):
+        deficits = {k: targets[k] - count[k] for k in count}
+        best = max(deficits, key=lambda k: deficits[k])
+        assigned[best].add(h5p)
+        count[best] += nsc
+
+    def split_for_file(h5p: str) -> str:
+        if h5p in assigned["train"]:
+            return "train"
+        if h5p in assigned["val"]:
+            return "val"
+        return "test"
+
+    return split_for_file, assigned, count, targets
 
 
 def create_dataset(
@@ -174,9 +207,7 @@ def create_dataset(
     # Limit number for testing
     if max_h5_files is not None and max_h5_files > 0 and len(h5_paths) > max_h5_files:
         h5_paths = h5_paths[:max_h5_files]
-        print(
-            f"[list] Using only first {len(h5_paths)} HDF5 files (max_h5_files={max_h5_files})"
-        )
+        print(f"[list] Using only first {len(h5_paths)} HDF5 files (max_h5_files={max_h5_files})")
 
     # ==================================================
     # Phase 1 — scan and build unified KEYPOINT ORDER
@@ -219,21 +250,24 @@ def create_dataset(
     print(f"\n[index] Scenes: {len(all_scenes)}")
     print(f"[kps] Unified KP_ORDER ({len(KP_ORDER)}): {', '.join(KP_ORDER)}")
 
-    # Shuffle & split scenes
-    random.shuffle(all_scenes)
-    n = len(all_scenes)
-    n_train = int(n * split[0])
-    n_val = int(n * split[1])
-    sets = {
-        "train": set(all_scenes[:n_train]),
-        "val": set(all_scenes[n_train : n_train + n_val]),
-        "test": set(all_scenes[n_train + n_val :]),
-    }
-
     # Group scenes by file
     scenes_by_file: Dict[str, List[str]] = defaultdict(list)
     for h5p, s in all_scenes:
         scenes_by_file[h5p].append(s)
+
+    # ==================================================
+    # Bag-level split (balanced by scene counts)
+    # ==================================================
+    split_for_file, assigned_files, scene_counts, targets = _balanced_bag_split_by_scene_count(
+        scenes_by_file=scenes_by_file,
+        split=split,
+        seed=RANDOM_SEED,
+    )
+
+    print("\n--- Split (BAG-LEVEL, balanced by SCENE COUNT) ---")
+    print("[split] target scenes:", targets)
+    print("[split] actual scenes:", scene_counts)
+    print("[split] files per split:", {k: len(v) for k, v in assigned_files.items()})
 
     # ==================================================
     # Phase 2 — export dataset
@@ -246,7 +280,8 @@ def create_dataset(
     files_with_valid_scenes = 0
 
     for fi, (h5p, scene_list) in enumerate(scenes_by_file.items(), 1):
-        print(f"[{fi}/{total_files}] {Path(h5p).name}  scenes={len(scene_list)}")
+        split_name_for_file = split_for_file(h5p)
+        print(f"[{fi}/{total_files}] {Path(h5p).name}  scenes={len(scene_list)}  -> {split_name_for_file}")
 
         file_valid_scenes = 0
 
@@ -258,11 +293,7 @@ def create_dataset(
                 for scene_name in scene_list:
                     file_stem = Path(h5p).stem
                     unique_scene = f"{file_stem}__{scene_name}"
-                    split_name = (
-                        "train"
-                        if (h5p, scene_name) in sets["train"]
-                        else ("val" if (h5p, scene_name) in sets["val"] else "test")
-                    )
+                    split_name = split_name_for_file
                     print(f"  - {unique_scene} → {split_name}")
 
                     grp = f[scene_name]
@@ -327,9 +358,7 @@ def create_dataset(
                         img = cv2.medianBlur(img, MEDIAN_KSIZE)
 
                     # xyz grid (LiDAR frame)
-                    xyz = np.stack(
-                        [flat[:, ix], flat[:, iy], flat[:, iz]], axis=1
-                    ).astype(np.float64)
+                    xyz = np.stack([flat[:, ix], flat[:, iy], flat[:, iz]], axis=1).astype(np.float64)
                     xyz_hw3 = xyz.reshape(H, W, 3)
 
                     # --- bbox from is_aircraft mask (BEFORE possible roll) ---
@@ -343,22 +372,16 @@ def create_dataset(
 
                     # --- ROLL LOGIC (smart seam placement) ---
                     if ROLL_WIDE_BBOX and bbox_frac > ROLL_WIDE_BBOX_FRAC and W > 1:
-                        # Prefer data-driven seam placement
                         shift = find_best_azimuth_roll(mask2d)
                         if shift == 0:
-                            # Fallback to config roll if seam logic fails
                             shift = ROLL_WIDE_BBOX_COLS % W
 
                         if shift != 0:
-                            print(
-                                f"    [ROLL] Wide bbox (frac={bbox_frac:.3f}) "
-                                f"→ rolling by {shift} cols"
-                            )
+                            print(f"    [ROLL] Wide bbox (frac={bbox_frac:.3f}) → rolling by {shift} cols")
                             img = np.roll(img, shift=shift, axis=1)
                             mask2d = np.roll(mask2d, shift=shift, axis=1)
                             xyz_hw3 = np.roll(xyz_hw3, shift=shift, axis=1)
 
-                            # recompute bbox after roll
                             bb2 = bbox_from_mask(mask2d)
                             if bb2 is None:
                                 print("    [SKIP] Empty aircraft mask after roll")
@@ -367,11 +390,8 @@ def create_dataset(
                             bbox_w = (x2 - x1 + 1)
                             bbox_frac = bbox_w / float(W)
 
-                        # still too wide → probably something really off, skip
                         if bbox_frac > 0.6:
-                            print(
-                                f"    [SKIP] BBox too wide ({bbox_frac:.3f} > 0.6) in {unique_scene}"
-                            )
+                            print(f"    [SKIP] BBox too wide ({bbox_frac:.3f} > 0.6) in {unique_scene}")
                             continue
 
                     # normalized bbox
@@ -379,10 +399,7 @@ def create_dataset(
 
                     # aircraft points and ground z
                     aircraft_pts = xyz_hw3[mask2d]  # (Na, 3)
-                    if aircraft_pts.size > 0:
-                        z_min_air = float(np.min(aircraft_pts[:, 2]))
-                    else:
-                        z_min_air = 0.0
+                    z_min_air = float(np.min(aircraft_pts[:, 2])) if aircraft_pts.size > 0 else 0.0
 
                     # range image for ray-tracing visibility
                     range_img = np.linalg.norm(xyz_hw3, axis=2)  # (H, W)
@@ -412,20 +429,14 @@ def create_dataset(
                         n.decode("utf-8") if isinstance(n, (bytes, bytearray)) else str(n)
                         for n in (raw_names[()] if raw_names is not None else [])
                     ]
-                    if (
-                        kps_model.ndim != 2
-                        or kps_model.shape[1] != 3
-                        or kps_model.shape[0] == 0
-                    ):
+                    if kps_model.ndim != 2 or kps_model.shape[1] != 3 or kps_model.shape[0] == 0:
                         print("    [SKIP] Keypoints malformed")
                         continue
 
                     ok_rows = np.all(np.isfinite(kps_model), axis=1)
                     kps_model = kps_model[ok_rows]
                     if scene_names_list:
-                        scene_names_list = [
-                            scene_names_list[i] for i, t in enumerate(ok_rows) if t
-                        ]
+                        scene_names_list = [scene_names_list[i] for i, t in enumerate(ok_rows) if t]
                     else:
                         scene_names_list = [f"k{i}" for i in range(kps_model.shape[0])]
 
@@ -452,12 +463,11 @@ def create_dataset(
                         T_ = np.asarray(grp["metadata"]["tf_matrix"][()], dtype=np.float64)
                         if T_.shape == (4, 4) and np.all(np.isfinite(T_)):
                             T = T_ if not APPLY_Z_FLIP else (T_ @ np.diag([1.0, 1.0, -1.0, 1.0]))
+
                     kps_scene = kps_kept.copy()
                     if ("base_link" in name_to_idx_kept) and (T is not None):
                         i_base = name_to_idx_kept["base_link"]
-                        kps_scene[i_base : i_base + 1] = apply_transform(
-                            kps_scene[i_base : i_base + 1], T
-                        )
+                        kps_scene[i_base : i_base + 1] = apply_transform(kps_scene[i_base : i_base + 1], T)
 
                     # project regular keypoints
                     rc_by_name: Dict[str, Tuple[int, int]] = {}
@@ -471,7 +481,6 @@ def create_dataset(
                             r = row_from_elevation(elv, el_per_row_calib, H)
                             c = col_from_azimuth_global(azv, az_per_col_calib, W)
 
-                            # bounds check
                             if r < 0 or r >= H or c < 0 or c >= W:
                                 vis_by_name[nm] = 0
                                 continue
@@ -479,22 +488,13 @@ def create_dataset(
                             r_int = int(r)
                             c_int = int(c)
 
-                            # base_link at top row → invisible
                             if nm == "base_link" and r_int == 0:
                                 vis_by_name[nm] = 0
                                 continue
 
-                            # Ray-tracing visibility
                             if RAY_VISIBILITY_CHECK:
-                                R_hit = get_min_depth(
-                                    range_img,
-                                    valid_range,
-                                    r_int,
-                                    c_int,
-                                    RAY_PATCH_RADIUS,
-                                )
+                                R_hit = get_min_depth(range_img, valid_range, r_int, c_int, RAY_PATCH_RADIUS)
                                 R_kp = float(np.linalg.norm(kps_scene[jj]))
-
                                 if R_hit is not None and np.isfinite(R_kp):
                                     if R_kp > R_hit + RAY_TOL:
                                         vis_by_name[nm] = 0
@@ -524,15 +524,8 @@ def create_dataset(
                             c_syn_int = int(c_syn)
 
                             if RAY_VISIBILITY_CHECK:
-                                R_hit_syn = get_min_depth(
-                                    range_img,
-                                    valid_range,
-                                    r_syn_int,
-                                    c_syn_int,
-                                    RAY_PATCH_RADIUS,
-                                )
+                                R_hit_syn = get_min_depth(range_img, valid_range, r_syn_int, c_syn_int, RAY_PATCH_RADIUS)
                                 R_kp_syn = float(np.linalg.norm(mid_adj_3d))
-
                                 if R_hit_syn is not None and np.isfinite(R_kp_syn):
                                     if R_kp_syn > R_hit_syn + RAY_TOL:
                                         vis_by_name[SYN_KP_NAME] = 0
@@ -548,9 +541,7 @@ def create_dataset(
                         vis_by_name[SYN_KP_NAME] = 0
 
                     # save image
-                    img_path = (
-                        Path(out_dir) / "images" / split_name / f"{unique_scene}.png"
-                    )
+                    img_path = Path(out_dir) / "images" / split_name / f"{unique_scene}.png"
                     imageio.imwrite(str(img_path), img, compress_level=1)
 
                     # visualizations
@@ -561,14 +552,7 @@ def create_dataset(
                         for kp_name, (r0, c0) in rc_by_name.items():
                             if vis_by_name.get(kp_name, 0) <= 0:
                                 continue
-                            cv2.circle(
-                                vis_img,
-                                (int(c0), int(r0)),
-                                3,
-                                (0, 0, 255),
-                                -1,
-                                lineType=cv2.LINE_AA,
-                            )
+                            cv2.circle(vis_img, (int(c0), int(r0)), 3, (0, 0, 255), -1, lineType=cv2.LINE_AA)
                             cv2.putText(
                                 vis_img,
                                 kp_name,
@@ -595,13 +579,7 @@ def create_dataset(
                         imageio.imwrite(str(vis_path), vis_img, compress_level=1)
 
                     # YOLO label
-                    parts = [
-                        "0",
-                        f"{cx:.6f}",
-                        f"{cy:.6f}",
-                        f"{bw:.6f}",
-                        f"{bh:.6f}",
-                    ]
+                    parts = ["0", f"{cx:.6f}", f"{cy:.6f}", f"{bw:.6f}", f"{bh:.6f}"]
                     for kp in KP_ORDER:
                         if kp in rc_by_name and vis_by_name.get(kp, 0) > 0:
                             r0, c0 = rc_by_name[kp]
@@ -627,9 +605,7 @@ def create_dataset(
             print("  -> no valid scenes exported from this file")
 
     print(f"\n[summary] Total valid scenes exported: {total_valid_scenes}")
-    print(
-        f"[summary] H5 files with >= 1 valid scene: {files_with_valid_scenes}/{total_files}"
-    )
+    print(f"[summary] H5 files with >= 1 valid scene: {files_with_valid_scenes}/{total_files}")
 
     # YAML
     yaml_text = (
@@ -655,6 +631,10 @@ keypoints:
                 "source": source,
                 "out_dir": out_dir,
                 "split": split,
+                "split_mode": "bag_level_balanced_by_scene_count",
+                "assigned_files": {k: sorted(list(v)) for k, v in assigned_files.items()},
+                "target_scene_counts": targets,
+                "actual_scene_counts": scene_counts,
                 "kp_order": KP_ORDER,
                 "kpt_bbox_margin_px": KPT_BBOX_MARGIN_PX,
                 "roll_wide_bbox": ROLL_WIDE_BBOX,

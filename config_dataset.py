@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 
 # Data source: GCS prefix or local directory
 SOURCE: str = (
-    "gs://evitado_data/ml_datasets/thesis_femi_dataset_2025/verified_bags"
+    "gs://evitado_data/ml_datasets/thesis_femi_dataset_2025/verified_bags_v2"
 )
 
 # Output root directory for YOLO dataset

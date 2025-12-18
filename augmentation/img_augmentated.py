@@ -39,7 +39,7 @@ import numpy as np
 DATA_ROOT = Path("../aircraft_pose_all")  # adjust if needed
 
 # Now we can augment multiple splits
-SPLITS = ["train", "val", "test"]  # often you want ["train"] only
+SPLITS = ["train"]  # often you want ["train"] only
 
 # Horizontal circular shifts (in pixels) – azimuth rotations.
 ROLL_SHIFTS = [
@@ -53,14 +53,14 @@ ROLL_SHIFTS = [
 # Uniform scale factors around image center:
 # <1 = zoom out (aircraft smaller), >1 = zoom in (aircraft larger)
 SCALE_FACTORS = [
-    0.30, 0.40, 0.50, 0.60, 0.75, 0.85,
-    1.15, 1.25, 1.40, 1.60, 1.80, 2.00
+     0.60, 0.75, 0.85,
+    1.15, 1.25, 1.40, 1.60
 ]
 
 
 # Small vertical translations in pixels (no wrap-around)
 # negative = shift up, positive = shift down
-VSHIFT_PIXELS = [-64, -48, -32, -16, 16]
+VSHIFT_PIXELS = [ -8, 8]
 
 
 # Name suffixes
