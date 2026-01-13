@@ -17,7 +17,7 @@ SOURCE: str = (
 )
 
 # Output root directory for YOLO dataset
-OUT_DIR: str = "./aircraft_pose_all"
+OUT_DIR: str = "./aircraft_pose_all2"
 
 # Dataset split (train, val, test) — must sum to 1.0
 SPLIT: Tuple[float, float, float] = (0.8, 0.1, 0.1)

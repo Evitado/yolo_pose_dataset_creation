@@ -36,10 +36,10 @@ import numpy as np
 # =========================
 # CONFIG
 # =========================
-DATA_ROOT = Path("../aircraft_pose_all")  # adjust if needed
+DATA_ROOT = Path("../aircraft_pose_all2")  # adjust if needed
 
 # Now we can augment multiple splits
-SPLITS = ["train"]  # often you want ["train"] only
+SPLITS = ["train","val"]  # often you want ["train"] only
 
 # Horizontal circular shifts (in pixels) – azimuth rotations.
 ROLL_SHIFTS = [
