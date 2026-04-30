@@ -15,8 +15,51 @@ Projection / math helpers for YOLO-pose aircraft dataset creation.
 from typing import List, Tuple, Optional
 
 import numpy as np
+import cv2
 
-from config_dataset import FLIP_VERTICAL_FOR_DRAW, KEYPOINT_AZ_SHIFT_COLS
+from config_dataset import (
+    FLIP_VERTICAL_FOR_DRAW,
+    KEYPOINT_AZ_SHIFT_COLS,
+    IMAGE_RENDER_MODE,
+    IMAGE_CHANNEL_FIELDS,
+    MULTI_FIELD_CHANNEL_BALANCE,
+    MULTI_FIELD_CHANNEL_BALANCE_MIN_GAIN,
+    MULTI_FIELD_CHANNEL_BALANCE_MAX_GAIN,
+    IMAGE_COLORMAP,
+    BLUE_CHANNEL_MODE,
+    BLUE_CHANNEL_GAMMA,
+    FAR_BRIGHT_BOOST_ENABLE,
+    FAR_BRIGHT_BOOST_FIELDS,
+    FAR_BRIGHT_BOOST_STRENGTH,
+    INTENSITY_BOOST_ENABLE,
+    INTENSITY_BOOST_GAIN,
+    INTENSITY_ROW_CORRECTION_ENABLE,
+    REFLECTIVITY_ROW_CORRECTION_ENABLE,
+    INTENSITY_ROW_CORRECTION_STRENGTH,
+    INTENSITY_ROW_CORRECTION_SIGMA_ROWS,
+    INTENSITY_ROW_CORRECTION_MAX_SHIFT,
+    SINGLE_CHANNEL_FIELD,
+    RANGE_BRIGHT_MIN_M,
+    RANGE_BRIGHT_MAX_M,
+    RANGE_BRIGHT_SOFT_EDGE_M,
+    RANGE_BRIGHT_OUTSIDE_LEVEL,
+    RANGE_BRIGHT_PEAK_LEVEL,
+    RETINEX_MODE,
+    RETINEX_SIGMAS,
+    RETINEX_GAIN,
+    RETINEX_OFFSET,
+    RETINEX_EPS,
+    RETINEX_CLAHE_ENABLE,
+    RETINEX_CLAHE_ONLY_SSR,
+    RETINEX_CLAHE_CLIP_LIMIT,
+    RETINEX_CLAHE_TILE_GRID,
+)
+
+FAR_BRIGHT_BOOST_FIELD_SET = {
+    str(name).strip().lower()
+    for name in FAR_BRIGHT_BOOST_FIELDS
+    if str(name).strip()
+}
 
 
 def _norm_name(s: str) -> str:
@@ -32,54 +75,416 @@ def find_alias(names: List[str], aliases: List[str]) -> Optional[str]:
     return None
 
 
-def _autoscale(img: np.ndarray, nan_fill: float = 0.0) -> np.ndarray:
-    clean = np.nan_to_num(img, nan=nan_fill)
-    vmin, vmax = np.percentile(clean, (1, 99))
-    denom = (vmax - vmin) if (vmax > vmin) else 1.0
-    return np.clip((clean - vmin) / (denom + 1e-12), 0.0, 1.0)
+def _dashcam_gray_v01(field_values: np.ndarray) -> np.ndarray:
+    """
+    Replicates dashcam viewer ImageViewer.drawImage processing:
+      1) uint16 -> float via /65535
+      2) sigma rescale using mean ± 2σ
+      3) tone mapping x / (1 + x)
+
+    Returns float values in [0, 1].
+    """
+    float_image = field_values.astype(np.float32) / 65535.0
+
+    mean = float(np.mean(float_image))
+    variance = float(np.mean((float_image - mean) ** 2))
+    sigma = float(np.sqrt(variance))
+
+    low = max(0.0, mean - 2.0 * sigma)
+    high = mean + 2.0 * sigma
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scaled = (float_image - low) / (high - low)
+        toned = scaled / (1.0 + scaled)
+
+    toned = np.nan_to_num(toned, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(toned, 0.0, 1.0)
+
+def _normalize_percentile01(img: np.ndarray, p_lo: float = 1.0, p_hi: float = 99.0) -> np.ndarray:
+    x = np.nan_to_num(img.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    lo, hi = np.percentile(x, (p_lo, p_hi))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.clip(x, 0.0, 1.0)
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
 
 
-def _norm_uint8(x: np.ndarray) -> np.ndarray:
-    return (_autoscale(x) * 255).astype(np.uint8)
+def _retinex_single_scale(gray01: np.ndarray, sigma: float, eps: float) -> np.ndarray:
+    x = np.clip(gray01.astype(np.float32), 0.0, 1.0)
+    if sigma <= 0:
+        blur = x
+    else:
+        blur = cv2.GaussianBlur(
+            x,
+            (0, 0),
+            sigmaX=float(sigma),
+            sigmaY=float(sigma),
+            borderType=cv2.BORDER_REPLICATE,
+        )
+    return np.log(x + eps) - np.log(blur + eps)
+
+
+def _apply_retinex(gray01: np.ndarray) -> np.ndarray:
+    mode = str(RETINEX_MODE).strip().lower()
+    if mode in ("", "off", "none", "false", "0"):
+        return np.clip(gray01, 0.0, 1.0)
+
+    sigmas = [float(s) for s in RETINEX_SIGMAS if float(s) > 0.0]
+    if not sigmas:
+        sigmas = [80.0]
+
+    eps = float(RETINEX_EPS)
+    if eps <= 0.0:
+        eps = 1e-6
+
+    if mode == "ssr":
+        response = _retinex_single_scale(gray01, sigmas[0], eps)
+    else:
+        # default to MSR behavior for unknown/"msr" mode
+        stack = [_retinex_single_scale(gray01, s, eps) for s in sigmas]
+        response = np.mean(stack, axis=0).astype(np.float32)
+
+    response = float(RETINEX_GAIN) * response + float(RETINEX_OFFSET)
+    return _normalize_percentile01(response, 1.0, 99.0)
+
+
+def _apply_clahe_gray01(gray01: np.ndarray, clip_limit: float, tile_grid: int) -> np.ndarray:
+    x = np.clip(gray01.astype(np.float32), 0.0, 1.0)
+    u8 = np.round(x * 255.0).astype(np.uint8)
+    g = max(1, int(tile_grid))
+    cl = max(0.01, float(clip_limit))
+    clahe = cv2.createCLAHE(clipLimit=cl, tileGridSize=(g, g))
+    out = clahe.apply(u8).astype(np.float32) / 255.0
+    return np.clip(out, 0.0, 1.0)
+
+
+def _apply_post_retinex_enhancement(gray01: np.ndarray) -> np.ndarray:
+    if not bool(RETINEX_CLAHE_ENABLE):
+        return gray01
+
+    mode = str(RETINEX_MODE).strip().lower()
+    if bool(RETINEX_CLAHE_ONLY_SSR) and mode != "ssr":
+        return gray01
+
+    return _apply_clahe_gray01(
+        gray01,
+        clip_limit=float(RETINEX_CLAHE_CLIP_LIMIT),
+        tile_grid=int(RETINEX_CLAHE_TILE_GRID),
+    )
+
+
+def _colormap_from_stops(gray01: np.ndarray, stops: np.ndarray) -> np.ndarray:
+    x = np.clip(gray01, 0.0, 1.0)
+    out = np.empty((*x.shape, 3), dtype=np.uint8)
+    out[..., 0] = np.round(np.interp(x, stops[:, 0], stops[:, 1])).astype(np.uint8)
+    out[..., 1] = np.round(np.interp(x, stops[:, 0], stops[:, 2])).astype(np.uint8)
+    out[..., 2] = np.round(np.interp(x, stops[:, 0], stops[:, 3])).astype(np.uint8)
+    return out
+
+
+def _apply_colormap(gray01: np.ndarray, colormap: str) -> np.ndarray:
+    mode = str(colormap).strip().lower()
+    x = np.clip(gray01, 0.0, 1.0)
+
+    if mode == "viridis":
+        stops = np.array([
+            [0.0, 68, 1, 84],
+            [0.25, 59, 82, 139],
+            [0.5, 33, 145, 140],
+            [0.75, 94, 201, 98],
+            [1.0, 253, 231, 37],
+        ], dtype=np.float32)
+        return _colormap_from_stops(x, stops)
+
+    if mode == "plasma":
+        stops = np.array([
+            [0.0, 13, 8, 135],
+            [0.25, 126, 3, 167],
+            [0.5, 203, 71, 119],
+            [0.75, 248, 149, 64],
+            [1.0, 240, 249, 33],
+        ], dtype=np.float32)
+        return _colormap_from_stops(x, stops)
+
+    if mode == "jet":
+        r = np.clip(1.5 - np.abs(4.0 * x - 3.0), 0.0, 1.0)
+        g = np.clip(1.5 - np.abs(4.0 * x - 2.0), 0.0, 1.0)
+        b = np.clip(1.5 - np.abs(4.0 * x - 1.0), 0.0, 1.0)
+        return np.stack([
+            np.round(r * 255).astype(np.uint8),
+            np.round(g * 255).astype(np.uint8),
+            np.round(b * 255).astype(np.uint8),
+        ], axis=-1)
+
+    # grayscale fallback
+    v = np.round(x * 255).astype(np.uint8)
+    return np.stack([v, v, v], axis=-1)
+
+
+def _range_to_gray01(values: np.ndarray, mode: str, gamma: float) -> np.ndarray:
+    vals = values.astype(np.float32)
+    valid = np.isfinite(vals) & (vals > 0.0)
+    out = np.zeros(vals.shape, dtype=np.float32)
+    if not np.any(valid):
+        return out
+
+    vals_valid = vals[valid]
+    m = str(mode).strip().lower()
+    if m in {"bright_band", "range_bright_band", "band_bright"}:
+        lo_m = float(min(RANGE_BRIGHT_MIN_M, RANGE_BRIGHT_MAX_M))
+        hi_m = float(max(RANGE_BRIGHT_MIN_M, RANGE_BRIGHT_MAX_M))
+        soft = max(1e-6, float(RANGE_BRIGHT_SOFT_EDGE_M))
+        outside = float(np.clip(RANGE_BRIGHT_OUTSIDE_LEVEL, 0.0, 1.0))
+        peak = float(np.clip(RANGE_BRIGHT_PEAK_LEVEL, outside, 1.0))
+
+        base_valid = np.full(vals_valid.shape, outside, dtype=np.float32)
+
+        core = (vals_valid >= lo_m) & (vals_valid <= hi_m)
+        base_valid[core] = peak
+
+        left = (vals_valid >= (lo_m - soft)) & (vals_valid < lo_m)
+        if np.any(left):
+            t = (vals_valid[left] - (lo_m - soft)) / soft
+            base_valid[left] = outside + t * (peak - outside)
+
+        right = (vals_valid > hi_m) & (vals_valid <= (hi_m + soft))
+        if np.any(right):
+            t = (vals_valid[right] - hi_m) / soft
+            base_valid[right] = peak - t * (peak - outside)
+    elif m == "log_range":
+        work = np.log(vals_valid)
+        lo, hi = np.percentile(work, (1.0, 99.0))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            base_valid = np.clip(work, 0.0, 1.0)
+        else:
+            base_valid = np.clip((work - lo) / (hi - lo), 0.0, 1.0)
+    elif m == "inverse_range":
+        lo, hi = np.percentile(vals_valid, (1.0, 99.0))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            base_valid = np.clip(vals_valid, 0.0, 1.0)
+        else:
+            base_valid = np.clip((vals_valid - lo) / (hi - lo), 0.0, 1.0)
+        base_valid = 1.0 - base_valid
+    elif m == "range":
+        lo, hi = np.percentile(vals_valid, (1.0, 99.0))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            base_valid = np.clip(vals_valid, 0.0, 1.0)
+        else:
+            base_valid = np.clip((vals_valid - lo) / (hi - lo), 0.0, 1.0)
+    else:
+        # default: near brighter, far darker
+        work = np.log(vals_valid)
+        lo, hi = np.percentile(work, (1.0, 99.0))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            base_valid = np.clip(work, 0.0, 1.0)
+        else:
+            base_valid = np.clip((work - lo) / (hi - lo), 0.0, 1.0)
+        base_valid = 1.0 - base_valid
+
+    g = max(float(gamma), 1e-6)
+    if abs(g - 1.0) > 1e-6:
+        base_valid = np.power(np.clip(base_valid, 0.0, 1.0), g)
+
+    out[valid] = np.clip(base_valid, 0.0, 1.0)
+    return out
+
+
+def _compute_far_boost_from_range(flat: np.ndarray, idx: dict[str, int]) -> Optional[np.ndarray]:
+    if not bool(FAR_BRIGHT_BOOST_ENABLE):
+        return None
+    if "range" not in idx:
+        return None
+    boost = _range_to_gray01(flat[:, idx["range"]], BLUE_CHANNEL_MODE, BLUE_CHANNEL_GAMMA)
+    return np.clip(boost, 0.0, 1.0)
+
+
+def _apply_intensity_row_correction(gray01_2d: np.ndarray) -> np.ndarray:
+    """
+    Light row-wise correction for ring-like horizontal bands.
+    """
+    if not bool(INTENSITY_ROW_CORRECTION_ENABLE):
+        return gray01_2d
+
+    x = np.clip(np.asarray(gray01_2d, dtype=np.float32), 0.0, 1.0)
+    if x.ndim != 2 or x.shape[0] < 3:
+        return x
+
+    strength = float(np.clip(INTENSITY_ROW_CORRECTION_STRENGTH, 0.0, 1.5))
+    sigma = max(0.0, float(INTENSITY_ROW_CORRECTION_SIGMA_ROWS))
+    if strength <= 0.0 or sigma <= 0.0:
+        return x
+
+    row_profile = np.nanmedian(x, axis=1).astype(np.float32)
+    if not np.all(np.isfinite(row_profile)):
+        m = np.isfinite(row_profile)
+        if not np.any(m):
+            return x
+        fill = float(np.nanmedian(row_profile[m]))
+        row_profile = np.where(m, row_profile, fill)
+
+    trend = cv2.GaussianBlur(
+        row_profile.reshape(-1, 1),
+        (0, 0),
+        sigmaX=0.0,
+        sigmaY=sigma,
+        borderType=cv2.BORDER_REPLICATE,
+    ).reshape(-1)
+
+    band = row_profile - trend
+    max_shift = max(0.0, float(INTENSITY_ROW_CORRECTION_MAX_SHIFT))
+    if max_shift > 0.0:
+        band = np.clip(band, -max_shift, max_shift)
+
+    corrected = x - strength * band[:, None]
+    corrected += float(np.mean(x) - np.mean(corrected))
+    return np.clip(corrected, 0.0, 1.0)
+
+
+def _needs_row_correction(field_name: str) -> bool:
+    f = str(field_name).strip().lower()
+    if f == "intensity":
+        return bool(INTENSITY_ROW_CORRECTION_ENABLE)
+    if f == "reflectivity":
+        return bool(REFLECTIVITY_ROW_CORRECTION_ENABLE)
+    return False
+
+
+def _field_to_gray01(
+    flat: np.ndarray,
+    idx: dict[str, int],
+    field_name: str,
+    far_boost01: Optional[np.ndarray] = None,
+) -> Optional[np.ndarray]:
+    f = str(field_name).strip().lower()
+    if f not in idx:
+        return None
+    vals = flat[:, idx[f]]
+    if f == "range":
+        mode = str(BLUE_CHANNEL_MODE).strip().lower()
+        if mode == "dashcam":
+            return _dashcam_gray_v01(vals)
+        return _range_to_gray01(vals, BLUE_CHANNEL_MODE, BLUE_CHANNEL_GAMMA)
+    if f in {"reflectivity", "intensity", "signal", "ambient"}:
+        base = _dashcam_gray_v01(vals)
+        if (
+            far_boost01 is not None
+            and f in FAR_BRIGHT_BOOST_FIELD_SET
+            and bool(FAR_BRIGHT_BOOST_ENABLE)
+            and FAR_BRIGHT_BOOST_STRENGTH > 0
+        ):
+            a = float(np.clip(FAR_BRIGHT_BOOST_STRENGTH, 0.0, 1.5))
+            base = np.clip(base + a * far_boost01 * (1.0 - base), 0.0, 1.0)
+        if f == "intensity" and bool(INTENSITY_BOOST_ENABLE):
+            g = max(0.0, float(INTENSITY_BOOST_GAIN))
+            if g != 1.0:
+                base = np.clip(base * g, 0.0, 1.0)
+        return base
+    return _normalize_percentile01(vals)
+
+
+def _build_single_field_colormap(flat: np.ndarray, idx: dict[str, int], H: int, W: int) -> Optional[np.ndarray]:
+    source_field = None
+    for candidate in ("range", "signal", "intensity", "reflectivity"):
+        if candidate in idx:
+            source_field = candidate
+            break
+    if source_field is None:
+        return None
+
+    field = flat[:, idx[source_field]]
+    gray01 = _dashcam_gray_v01(field).reshape(H, W)
+    if _needs_row_correction(source_field):
+        gray01 = _apply_intensity_row_correction(gray01)
+    gray01 = _apply_retinex(gray01)
+    gray01 = _apply_post_retinex_enhancement(gray01)
+    return _apply_colormap(gray01, IMAGE_COLORMAP)
+
+
+def _build_multi_field_rgb(flat: np.ndarray, idx: dict[str, int], H: int, W: int) -> Optional[np.ndarray]:
+    fields = tuple(str(f).strip().lower() for f in IMAGE_CHANNEL_FIELDS)
+    if len(fields) != 3:
+        return None
+
+    far_boost01 = _compute_far_boost_from_range(flat, idx)
+    chans01 = []
+    for f in fields:
+        gray01 = _field_to_gray01(flat, idx, f, far_boost01=far_boost01)
+        if gray01 is None:
+            return None
+        ch2d = np.clip(gray01, 0.0, 1.0).reshape(H, W)
+        if _needs_row_correction(f):
+            ch2d = _apply_intensity_row_correction(ch2d)
+        chans01.append(ch2d)
+
+    if bool(MULTI_FIELD_CHANNEL_BALANCE):
+        # Rebalance channels per scene so one field cannot dominate globally.
+        means = np.array([float(np.mean(ch)) for ch in chans01], dtype=np.float32)
+        valid = means > 1e-6
+        if np.count_nonzero(valid) >= 2:
+            target = float(np.median(means[valid]))
+            if target > 0.0:
+                min_gain = max(1e-6, float(MULTI_FIELD_CHANNEL_BALANCE_MIN_GAIN))
+                max_gain = max(min_gain, float(MULTI_FIELD_CHANNEL_BALANCE_MAX_GAIN))
+                gains = np.ones(3, dtype=np.float32)
+                gains[valid] = target / means[valid]
+                gains = np.clip(gains, min_gain, max_gain)
+                chans01 = [np.clip(ch * float(g), 0.0, 1.0) for ch, g in zip(chans01, gains)]
+
+    chans_u8 = [np.round(ch * 255.0).astype(np.uint8) for ch in chans01]
+    return np.stack(chans_u8, axis=-1)
 
 
 def build_rgb_from_cols(flat: np.ndarray, cols: List[str], H: int, W: int) -> Optional[np.ndarray]:
     """
-    Build an RGB image optimized for YOLO learning (not for nice visualization).
+    Build a dataset image from lidar columns.
 
-    Channels:
-      R = reflectivity (autoscaled per image)
-      G = intensity    (autoscaled per image)
-      B = "inverse log-range" (nearer = brighter, farther = darker)
+    Modes:
+      - single_field_colormap: one lidar field with colormap and optional Retinex.
+      - multi_field_rgb: map configured fields directly into RGB channels.
 
-    Requires columns: 'reflectivity', 'range', 'intensity'.
+    If multi-field mode is requested but required fields are missing, this falls
+    back to single-field colormap mode.
     """
-    idx = {c: i for i, c in enumerate(cols)}
-    if all(k in idx for k in ("reflectivity", "range", "intensity")):
-        refl  = flat[:, idx["reflectivity"]]
-        rng   = flat[:, idx["range"]]
-        inten = flat[:, idx["intensity"]]
+    idx = {str(c).strip().lower(): i for i, c in enumerate(cols)}
+    mode = str(IMAGE_RENDER_MODE).strip().lower()
 
-        # avoid log(0)
-        rng_safe = np.clip(rng, 1e-3, None)
-        log_range = np.log(rng_safe)
+    if mode in {"multi_field_rgb", "multi_field", "multichannel_rgb"}:
+        rgb = _build_multi_field_rgb(flat, idx, H, W)
+        if rgb is not None:
+            return rgb
 
-        # per-image autoscale to [0, 1]
-        refl_n      = _autoscale(refl)
-        inten_n     = _autoscale(inten)
-        log_range_n = _autoscale(log_range)
+    return _build_single_field_colormap(flat, idx, H, W)
 
-        # depth-like: near brighter, far darker
-        depth_like = 1.0 - log_range_n
-        depth_like = np.clip(depth_like, 0.0, 1.0)
 
-        r = (refl_n * 255).astype(np.uint8).reshape(H, W)
-        g = (inten_n * 255).astype(np.uint8).reshape(H, W)
-        b = (depth_like * 255).astype(np.uint8).reshape(H, W)
+def build_gray_from_cols(flat: np.ndarray, cols: List[str], H: int, W: int) -> Optional[np.ndarray]:
+    """
+    Build a single-channel uint8 image (H, W) from a lidar field.
+    """
+    idx = {str(c).strip().lower(): i for i, c in enumerate(cols)}
 
-        return np.stack([r, g, b], axis=-1)
+    preferred = str(SINGLE_CHANNEL_FIELD).strip().lower()
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    for c in ("range", "signal", "intensity", "reflectivity", "ambient"):
+        if c not in candidates:
+            candidates.append(c)
 
-    return None
+    far_boost01 = _compute_far_boost_from_range(flat, idx)
+    gray01 = None
+    selected_field = ""
+    for c in candidates:
+        gray01 = _field_to_gray01(flat, idx, c, far_boost01=far_boost01)
+        if gray01 is not None:
+            selected_field = c
+            break
+
+    if gray01 is None:
+        return None
+
+    gray2d = np.clip(gray01, 0.0, 1.0).reshape(H, W)
+    if _needs_row_correction(selected_field):
+        gray2d = _apply_intensity_row_correction(gray2d)
+    return np.round(gray2d * 255.0).astype(np.uint8)
 
 
 

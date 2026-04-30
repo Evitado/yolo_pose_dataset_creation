@@ -15,7 +15,7 @@ import subprocess
 import shlex
 import atexit
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import h5py
 
@@ -118,3 +118,45 @@ def open_h5_any(path: str) -> h5py.File:
         _CLEANUP.append(temp_file_path)
 
     return h5py.File(_H5_LOCAL_CACHE[path], "r")
+from pathlib import Path
+import csv
+
+def write_bag_split_columns_csv(
+    out_dir: str,
+    assigned_files: dict,
+    filename: str = "bag_split_columns.csv",
+):
+    """
+    Writes a column-wise CSV:
+      train, val, test
+      bag1, bagA, bagX
+      bag2, bagB,
+      bag3, , bagY
+    """
+
+    out_path = Path(out_dir) / filename
+
+    # Convert to sorted lists (use only bag names)
+    train_bags = sorted(Path(p).name for p in assigned_files.get("train", []))
+    val_bags   = sorted(Path(p).name for p in assigned_files.get("val", []))
+    test_bags  = sorted(Path(p).name for p in assigned_files.get("test", []))
+
+    max_len = max(len(train_bags), len(val_bags), len(test_bags))
+
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        # header
+        writer.writerow(["train", "val", "test"])
+
+        # rows (ragged-safe)
+        for i in range(max_len):
+            writer.writerow([
+                train_bags[i] if i < len(train_bags) else "",
+                val_bags[i]   if i < len(val_bags)   else "",
+                test_bags[i]  if i < len(test_bags)  else "",
+            ])
+
+    print("  -> bag split column CSV:", out_path.resolve())
+
+

@@ -4,31 +4,37 @@
 """
 Offline augmenter for YOLO pose dataset (aircraft range images).
 
-- Works on exported dataset structure:
-    root/
-      images/{train,val,test}/*.png
-      labels/{train,val,test}/*.txt
+Reads from DATA_ROOT and writes a NEW augmented dataset to OUT_ROOT.
 
-- For each image/label pair:
-    * creates several azimuth-roll (horizontal circular shift) variants
-    * creates several scale (zoom in/out) variants
-    * creates several small vertical-shift variants
+Input structure:
+  DATA_ROOT/
+    images/{train,val,test}/*.png
+    labels/{train,val,test}/*.txt
 
-Assumes label format (single line per file):
+Output structure:
+  OUT_ROOT/
+    images/{train,val,test}/*.png
+    labels/{train,val,test}/*.txt
+    vis/{train,val,test}/*.png   (optional)
+
+Augmentations implemented:
+  - azimuth-roll (horizontal circular shift): np.roll along axis=1
+  - scale (zoom in/out): warpAffine about image center
+  - vertical shift: warpAffine translate in y
+
+Label format (single line per file):
   class cx cy w h kp1x kp1y kp1v kp2x kp2y kp2v ...
 
 All coords normalized to [0,1], visibility v in {0,1}.
+Keypoints that leave the image are marked invisible (v=0, x=y=0).
 
-We do NOT enforce:
-  - keypoints near bbox
-  - bbox width limit
-
-Keypoints that leave the image during scaling/vertical shift are marked invisible (v=0).
+Recommended:
+  - Augment TRAIN only (do NOT augment val/test for fair evaluation).
 """
 
-import os
 from pathlib import Path
 from typing import Tuple
+import argparse
 
 import cv2
 import numpy as np
@@ -36,43 +42,36 @@ import numpy as np
 # =========================
 # CONFIG
 # =========================
-DATA_ROOT = Path("../aircraft_pose_all2")  # adjust if needed
+DATA_ROOT = Path("/home/femi/yolo_pose_dataset_creation/aircraft_pose_with_normalising_applied_multifield_only_3_2")        # INPUT dataset
+OUT_ROOT  = Path("/home/femi/yolo_pose_dataset_creation/aircraft_pose_with_normalising_applied_multifield_only_3_2aug_2")    # OUTPUT dataset (NEW)
 
-# Now we can augment multiple splits
-SPLITS = ["train","val"]  # often you want ["train"] only
+# Usually augment TRAIN only
+SPLITS = ["train"]
 
-# Horizontal circular shifts (in pixels) – azimuth rotations.
-ROLL_SHIFTS = [
-    16, 32, 64, 96, 128, 160, 192, 224,
-    256, 320, 384, 448, 512, 576, 640,
-    704, 768, 832, 896, 960, 1024, 1152,
-    1280, 1408, 1536, 1664, 1792
-]
-
+# Horizontal circular shifts (pixels). For W=1024, these are reasonable.
+ROLL_SHIFTS = [2,4,8,16,32,64,128, 256, 384, 512, 640, 768]
 
 # Uniform scale factors around image center:
 # <1 = zoom out (aircraft smaller), >1 = zoom in (aircraft larger)
-SCALE_FACTORS = [
-     0.60, 0.75, 0.85,
-    1.15, 1.25, 1.40, 1.60
-]
+SCALE_FACTORS = [0.9,1.1]  # e.g. [0.9, 1.1]
 
-
-# Small vertical translations in pixels (no wrap-around)
-# negative = shift up, positive = shift down
-VSHIFT_PIXELS = [ -8, 8]
-
+# Vertical translations in pixels (no wrap-around)
+VSHIFT_PIXELS = [2,-2]  # e.g. [-8, 8]
 
 # Name suffixes
 ROLL_SUFFIX = "roll"
 SCALE_SUFFIX = "scale"
 VSHIFT_SUFFIX = "vshift"
 
-# If True, skip images that already look augmented (contain suffix)
+# If True, skip inputs that already look augmented (contain suffix)
 SKIP_ALREADY_AUG = False
 
-# Visualization for augmented samples
-MAKE_VIZ = True  # set False if you don't want vis outputs for augmentations
+# If True, create visualization images (bbox + kpts) under OUT_ROOT/vis/<split>/
+MAKE_VIZ = True
+
+# If True, copy original (non-augmented) image+label into OUT_ROOT as well
+# so OUT_ROOT is a complete dataset on its own.
+COPY_ORIGINALS = True
 
 
 # =========================
@@ -93,7 +92,7 @@ def load_yolo_pose_label(label_path: Path) -> Tuple[int, float, float, float, fl
     parts = txt.split()
     cls_id = int(parts[0])
     cx = float(parts[1]); cy = float(parts[2])
-    w = float(parts[3]);  h = float(parts[4])
+    w  = float(parts[3]); h  = float(parts[4])
     rest = np.array([float(x) for x in parts[5:]], dtype=np.float32)
     if rest.size % 3 != 0:
         raise ValueError(f"Keypoints length not multiple of 3 in {label_path}")
@@ -109,7 +108,7 @@ def save_yolo_pose_label(
     w: float,
     h: float,
     kpts: np.ndarray
-):
+) -> None:
     """
     Save YOLO pose label back to disk.
     """
@@ -121,7 +120,7 @@ def save_yolo_pose_label(
     for x, y, v in kpts:
         parts.append(f"{x:.6f}")
         parts.append(f"{y:.6f}")
-        parts.append(str(int(round(v))))
+        parts.append(str(int(round(float(v)))))
     label_path.write_text(" ".join(parts) + "\n")
 
 
@@ -137,11 +136,9 @@ def save_vis_image(
     w: float,
     h: float,
     kpts: np.ndarray,
-):
+) -> None:
     """
     Save a visualization image with bbox and keypoints drawn.
-
-    - vis_dir / f"{stem}.png"
     """
     H, W = img.shape[:2]
 
@@ -151,7 +148,7 @@ def save_vis_image(
     x2 = int((cx + w / 2.0) * W)
     y2 = int((cy + h / 2.0) * H)
 
-    # clamp to image bounds
+    # clamp
     x1 = max(0, min(W - 1, x1))
     x2 = max(0, min(W - 1, x2))
     y1 = max(0, min(H - 1, y1))
@@ -159,15 +156,15 @@ def save_vis_image(
 
     vis_img = img.copy()
 
-    # draw bbox (green)
+    # bbox (green)
     cv2.rectangle(vis_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    # draw keypoints (red), label with index
+    # kpts (red)
     for idx, (x, y, v) in enumerate(kpts):
-        if v <= 0.0:
+        if float(v) <= 0.0:
             continue
-        x_px = int(x * W)
-        y_px = int(y * H)
+        x_px = int(float(x) * W)
+        y_px = int(float(y) * H)
         if x_px < 0 or x_px >= W or y_px < 0 or y_px >= H:
             continue
         cv2.circle(vis_img, (x_px, y_px), 3, (0, 0, 255), -1, lineType=cv2.LINE_AA)
@@ -187,7 +184,6 @@ def save_vis_image(
 # =========================
 def augment_roll(
     img: np.ndarray,
-    cls_id: int,
     cx: float,
     cy: float,
     w: float,
@@ -197,38 +193,30 @@ def augment_roll(
 ):
     """
     Horizontal circular roll by shift_px columns.
-
-    - Image: np.roll along axis=1
-    - bbox cx: shift in x
-    - keypoints x: shift in x
     """
     H, W = img.shape[:2]
-
-    # ---- image ----
     rolled_img = np.roll(img, shift=shift_px, axis=1)
 
-    # ---- bbox center ----
+    # bbox center x shift
     cx_px = cx * W
-    cx_px_rolled = (cx_px + shift_px) % W
-    cx_new = cx_px_rolled / W
+    cx_px_new = (cx_px + shift_px) % W
+    cx_new = cx_px_new / W
 
-    # ---- keypoints ----
+    # keypoints x shift
     kpts_new = kpts.copy()
     for i in range(kpts_new.shape[0]):
         x, y, v = kpts_new[i]
-        if v <= 0.0:
+        if float(v) <= 0.0:
             continue
-        x_px = x * W
-        x_px_rolled = (x_px + shift_px) % W
-        kpts_new[i, 0] = x_px_rolled / W
-        # y unchanged
+        x_px = float(x) * W
+        x_px_new = (x_px + shift_px) % W
+        kpts_new[i, 0] = x_px_new / W
 
-    return rolled_img, cx_new, cy, w, h, kpts_new
+    return rolled_img, float(cx_new), float(cy), float(w), float(h), kpts_new
 
 
 def augment_scale(
     img: np.ndarray,
-    cls_id: int,
     cx: float,
     cy: float,
     w: float,
@@ -237,17 +225,12 @@ def augment_scale(
     scale: float
 ):
     """
-    Uniform scale around image center using cv2.warpAffine.
-
-    - Image is scaled about the center with factor "scale" and kept at same size (H,W).
-    - bbox + keypoints scaled around center accordingly.
-    - Keypoints that go fully outside are marked invisible (v=0, x=y set to 0).
+    Uniform scale around image center.
     """
     H, W = img.shape[:2]
     cx_img = W / 2.0
     cy_img = H / 2.0
 
-    # ---- image: warpAffine with scaling around center ----
     M = cv2.getRotationMatrix2D((cx_img, cy_img), 0.0, scale)
     scaled_img = cv2.warpAffine(
         img, M, (W, H),
@@ -256,48 +239,36 @@ def augment_scale(
         borderValue=(0, 0, 0),
     )
 
-    # ---- bbox: scale around center ----
+    # bbox
     cx_px = cx * W
     cy_px = cy * H
     w_px  = w * W
     h_px  = h * H
 
-    # center scaled about image center
     cx_px_new = cx_img + scale * (cx_px - cx_img)
     cy_px_new = cy_img + scale * (cy_px - cy_img)
-    # width/height scaled
     w_px_new  = w_px * scale
     h_px_new  = h_px * scale
 
-    # convert back to normalized
-    cx_new = cx_px_new / W
-    cy_new = cy_px_new / H
-    w_new  = w_px_new  / W
-    h_new  = h_px_new  / H
+    cx_new = float(np.clip(cx_px_new / W, 0.0, 1.0))
+    cy_new = float(np.clip(cy_px_new / H, 0.0, 1.0))
+    w_new  = float(np.clip(w_px_new / W, 1e-6, 1.0))
+    h_new  = float(np.clip(h_px_new / H, 1e-6, 1.0))
 
-    # clip bbox to [0,1]
-    cx_new = float(np.clip(cx_new, 0.0, 1.0))
-    cy_new = float(np.clip(cy_new, 0.0, 1.0))
-    w_new  = float(np.clip(w_new,  1e-6, 1.0))
-    h_new  = float(np.clip(h_new,  1e-6, 1.0))
-
-    # ---- keypoints: scale around center ----
+    # keypoints
     kpts_new = kpts.copy()
     for i in range(kpts_new.shape[0]):
         x, y, v = kpts_new[i]
-        if v <= 0.0:
+        if float(v) <= 0.0:
             continue
 
-        x_px = x * W
-        y_px = y * H
+        x_px = float(x) * W
+        y_px = float(y) * H
 
-        # scale about center
         x_px_new = cx_img + scale * (x_px - cx_img)
         y_px_new = cy_img + scale * (y_px - cy_img)
 
-        # check if still inside image
         if x_px_new < 0 or x_px_new >= W or y_px_new < 0 or y_px_new >= H:
-            # mark invisible if fully outside
             kpts_new[i, 2] = 0.0
             kpts_new[i, 0] = 0.0
             kpts_new[i, 1] = 0.0
@@ -311,7 +282,6 @@ def augment_scale(
 
 def augment_vshift(
     img: np.ndarray,
-    cls_id: int,
     cx: float,
     cy: float,
     w: float,
@@ -321,15 +291,8 @@ def augment_vshift(
 ):
     """
     Vertical translation by shift_px pixels (no wraparound).
-
-    - Image: cv2.warpAffine with translation (0, shift_px)
-    - bbox cy: shifted by shift_px / H (clipped to [0,1])
-    - keypoints y: shifted by shift_px / H
-      keypoints that go out of [0,H) become invisible (v=0, x=y=0)
     """
     H, W = img.shape[:2]
-
-    # ---- image: translate vertically, pad with zeros ----
     M = np.float32([[1, 0, 0],
                     [0, 1, float(shift_px)]])
     shifted_img = cv2.warpAffine(
@@ -339,64 +302,61 @@ def augment_vshift(
         borderValue=(0, 0, 0),
     )
 
-    # ---- bbox center (only cy changes) ----
     cy_px = cy * H
     cy_px_new = cy_px + shift_px
-    cy_new = cy_px_new / H
-    cy_new = float(np.clip(cy_new, 0.0, 1.0))
+    cy_new = float(np.clip(cy_px_new / H, 0.0, 1.0))
 
-    # cx, w, h unchanged
-    cx_new = cx
-    w_new = w
-    h_new = h
-
-    # ---- keypoints ----
     kpts_new = kpts.copy()
     for i in range(kpts_new.shape[0]):
         x, y, v = kpts_new[i]
-        if v <= 0.0:
+        if float(v) <= 0.0:
             continue
 
-        y_px = y * H
+        y_px = float(y) * H
         y_px_new = y_px + shift_px
 
-        # if outside image vertically → mark invisible
         if (y_px_new < 0) or (y_px_new >= H):
             kpts_new[i, 2] = 0.0
             kpts_new[i, 0] = 0.0
             kpts_new[i, 1] = 0.0
         else:
             kpts_new[i, 1] = y_px_new / H
-            kpts_new[i, 2] = 1.0  # still visible
+            kpts_new[i, 2] = 1.0
 
-    return shifted_img, cx_new, cy_new, w_new, h_new, kpts_new
+    return shifted_img, float(cx), cy_new, float(w), float(h), kpts_new
 
 
 # =========================
 # Per-split processing
 # =========================
-def process_split(split: str):
-    img_dir = DATA_ROOT / "images" / split
-    lbl_dir = DATA_ROOT / "labels" / split
-    vis_dir = DATA_ROOT / "vis" / split
+def process_split(split: str) -> None:
+    in_img_dir = DATA_ROOT / "images" / split
+    in_lbl_dir = DATA_ROOT / "labels" / split
 
-    if not img_dir.is_dir() or not lbl_dir.is_dir():
-        print(f"[info] Split '{split}' not found (img: {img_dir}, lbl: {lbl_dir}), skipping.")
+    if not in_img_dir.is_dir() or not in_lbl_dir.is_dir():
+        print(f"[info] Split '{split}' not found (img: {in_img_dir}, lbl: {in_lbl_dir}), skipping.")
         return
 
-    if MAKE_VIZ:
-        vis_dir.mkdir(parents=True, exist_ok=True)
+    out_img_dir = OUT_ROOT / "images" / split
+    out_lbl_dir = OUT_ROOT / "labels" / split
+    out_vis_dir = OUT_ROOT / "vis" / split
 
-    img_paths = sorted(p for p in img_dir.glob("*.png"))
-    print(f"[info] Split '{split}': found {len(img_paths)} images in {img_dir}")
+    out_img_dir.mkdir(parents=True, exist_ok=True)
+    out_lbl_dir.mkdir(parents=True, exist_ok=True)
+    if MAKE_VIZ:
+        out_vis_dir.mkdir(parents=True, exist_ok=True)
+
+    img_paths = sorted(in_img_dir.glob("*.png"))
+    print(f"[info] Split '{split}': found {len(img_paths)} images in {in_img_dir}")
+    print(f"[info] Writing output to: {OUT_ROOT.resolve()}")
 
     for img_path in img_paths:
         stem = img_path.stem
+
         if SKIP_ALREADY_AUG and (ROLL_SUFFIX in stem or SCALE_SUFFIX in stem or VSHIFT_SUFFIX in stem):
-            # don't re-augment already augmented files
             continue
 
-        lbl_path = lbl_dir / f"{stem}.txt"
+        lbl_path = in_lbl_dir / f"{stem}.txt"
         if not lbl_path.exists():
             print(f"[warn] [{split}] No label for {img_path.name}, skipping.")
             continue
@@ -412,81 +372,131 @@ def process_split(split: str):
             print(f"[warn] [{split}] Bad label {lbl_path}: {e}")
             continue
 
+        # ---- copy original into OUT_ROOT (optional) ----
+        if COPY_ORIGINALS:
+            out_img0 = out_img_dir / f"{stem}.png"
+            out_lbl0 = out_lbl_dir / f"{stem}.txt"
+            if not out_img0.exists():
+                cv2.imwrite(str(out_img0), img)
+            if not out_lbl0.exists():
+                save_yolo_pose_label(out_lbl0, cls_id, cx, cy, w, h, kpts)
+            if MAKE_VIZ:
+                save_vis_image(out_vis_dir, stem, img, cx, cy, w, h, kpts)
+
         H, W = img.shape[:2]
 
-        # ---------- ROLL AUGMENTATIONS ----------
+        # ---------- ROLL ----------
         for shift_px in ROLL_SHIFTS:
-            shift_px_mod = shift_px % W
+            shift_px_mod = int(shift_px) % W
             if shift_px_mod == 0:
                 continue
 
             new_img, cx_new, cy_new, w_new, h_new, kpts_new = augment_roll(
-                img, cls_id, cx, cy, w, h, kpts, shift_px_mod
+                img, cx, cy, w, h, kpts, shift_px_mod
             )
 
             new_stem = f"{stem}_{ROLL_SUFFIX}{shift_px_mod}"
-            out_img_path = img_dir / f"{new_stem}.png"
-            out_lbl_path = lbl_dir / f"{new_stem}.txt"
+            out_img_path = out_img_dir / f"{new_stem}.png"
+            out_lbl_path = out_lbl_dir / f"{new_stem}.txt"
 
             cv2.imwrite(str(out_img_path), new_img)
             save_yolo_pose_label(out_lbl_path, cls_id, cx_new, cy_new, w_new, h_new, kpts_new)
 
             if MAKE_VIZ:
-                save_vis_image(vis_dir, new_stem, new_img, cx_new, cy_new, w_new, h_new, kpts_new)
+                save_vis_image(out_vis_dir, new_stem, new_img, cx_new, cy_new, w_new, h_new, kpts_new)
 
-        # ---------- SCALE AUGMENTATIONS ----------
+        # ---------- SCALE ----------
         for s in SCALE_FACTORS:
-            if abs(s - 1.0) < 1e-3:
+            if abs(float(s) - 1.0) < 1e-3:
                 continue
 
             new_img, cx_new, cy_new, w_new, h_new, kpts_new = augment_scale(
-                img, cls_id, cx, cy, w, h, kpts, s
+                img, cx, cy, w, h, kpts, float(s)
             )
 
-            s_tag = f"{s:.2f}".replace(".", "p")  # e.g. 0.85 -> "0p85"
+            s_tag = f"{float(s):.2f}".replace(".", "p")
             new_stem = f"{stem}_{SCALE_SUFFIX}{s_tag}"
-            out_img_path = img_dir / f"{new_stem}.png"
-            out_lbl_path = lbl_dir / f"{new_stem}.txt"
+            out_img_path = out_img_dir / f"{new_stem}.png"
+            out_lbl_path = out_lbl_dir / f"{new_stem}.txt"
 
             cv2.imwrite(str(out_img_path), new_img)
-            save_yolo_pose_label(
-                out_lbl_path, cls_id, cx_new, cy_new, w_new, h_new, kpts_new
-            )
+            save_yolo_pose_label(out_lbl_path, cls_id, cx_new, cy_new, w_new, h_new, kpts_new)
 
             if MAKE_VIZ:
-                save_vis_image(vis_dir, new_stem, new_img, cx_new, cy_new, w_new, h_new, kpts_new)
+                save_vis_image(out_vis_dir, new_stem, new_img, cx_new, cy_new, w_new, h_new, kpts_new)
 
-        # ---------- VERTICAL SHIFT AUGMENTATIONS ----------
+        # ---------- VSHIFT ----------
         for dy in VSHIFT_PIXELS:
+            dy = int(dy)
             if dy == 0:
                 continue
 
             new_img, cx_new, cy_new, w_new, h_new, kpts_new = augment_vshift(
-                img, cls_id, cx, cy, w, h, kpts, dy
+                img, cx, cy, w, h, kpts, dy
             )
 
-            if dy >= 0:
-                dy_tag = f"p{dy}"
-            else:
-                dy_tag = f"m{abs(dy)}"
-
+            dy_tag = f"p{dy}" if dy >= 0 else f"m{abs(dy)}"
             new_stem = f"{stem}_{VSHIFT_SUFFIX}{dy_tag}"
-            out_img_path = img_dir / f"{new_stem}.png"
-            out_lbl_path = lbl_dir / f"{new_stem}.txt"
+            out_img_path = out_img_dir / f"{new_stem}.png"
+            out_lbl_path = out_lbl_dir / f"{new_stem}.txt"
 
             cv2.imwrite(str(out_img_path), new_img)
             save_yolo_pose_label(out_lbl_path, cls_id, cx_new, cy_new, w_new, h_new, kpts_new)
 
             if MAKE_VIZ:
-                save_vis_image(vis_dir, new_stem, new_img, cx_new, cy_new, w_new, h_new, kpts_new)
+                save_vis_image(out_vis_dir, new_stem, new_img, cx_new, cy_new, w_new, h_new, kpts_new)
 
 
 # =========================
 # Main driver
 # =========================
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Offline augmenter for YOLO pose dataset."
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DATA_ROOT,
+        help=f"Input dataset root (default: {DATA_ROOT})",
+    )
+    parser.add_argument(
+        "--out-root",
+        type=Path,
+        default=OUT_ROOT,
+        help=f"Output dataset root (default: {OUT_ROOT})",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        choices=["train", "val", "test"],
+        default=SPLITS,
+        help=f"Dataset splits to process (default: {' '.join(SPLITS)})",
+    )
+    parser.add_argument(
+        "--allow-same-root",
+        action="store_true",
+        help="Allow writing to the same root as --data-root (disabled by default).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    global DATA_ROOT, OUT_ROOT
+
+    args = parse_args()
+    DATA_ROOT = args.data_root.expanduser().resolve()
+    OUT_ROOT = args.out_root.expanduser().resolve()
+
+    if DATA_ROOT == OUT_ROOT and not args.allow_same_root:
+        raise SystemExit(
+            "[error] DATA_ROOT and OUT_ROOT are the same. "
+            "Set --out-root to another folder or use --allow-same-root."
+        )
+
     print(f"[info] DATA_ROOT = {DATA_ROOT}")
-    for split in SPLITS:
+    print(f"[info] OUT_ROOT  = {OUT_ROOT}")
+    for split in args.splits:
         print(f"[info] === Processing split: {split} ===")
         process_split(split)
     print("[done] Augmentation finished for all requested splits.")
